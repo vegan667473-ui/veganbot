@@ -1,0 +1,113 @@
+
+import os
+import sys
+import random
+ 
+import chess
+import torch
+ 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+ 
+from board_encoder import board_to_tensor, get_legal_move_map
+from model import load_model
+ 
+ 
+class MaiaStyleEngine:
+ 
+    def __init__(
+        self,
+        model_path:  str   = "models/maia_style.pt",
+        temperature: float = 1.0,
+        top_k:       int   = 5,
+    ):
+        """
+        Load the trained model and prepare the engine.
+ 
+        Parameters
+        ----------
+        model_path  : Path to the .pt checkpoint created by train_model.py.
+        temperature : Sampling temperature (see module docstring above).
+        top_k       : How many top moves to consider when sampling.
+        """
+        self.temperature = max(temperature, 1e-6)
+        self.top_k       = max(top_k, 1)
+ 
+        self.model = load_model(model_path, device="cpu")
+        print(f"[Engine] Loaded {model_path}  "
+              f"(temperature={temperature}, top_k={top_k})")
+ 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Public interface
+    # ──────────────────────────────────────────────────────────────────────────
+ 
+    def get_move(self, board: chess.Board) -> chess.Move:
+        """
+        Choose and return a move for the current position.
+ 
+        Falls back to a random legal move in the (very unlikely) event that
+        the model fails.
+        """
+        legal_map = get_legal_move_map(board)   # {index: chess.Move}
+        if not legal_map:
+            return None
+ 
+        legal_indices = list(legal_map.keys())
+ 
+        try:
+            board_tensor = board_to_tensor(board)
+            probs = self.model.move_probs(board_tensor, legal_indices)
+            # probs[i] is the probability for legal_indices[i]
+ 
+            return self._sample(legal_indices, legal_map, probs)
+ 
+        except Exception as e:
+            print(f"[Engine] Warning: model inference failed ({e}). Random move.")
+            return random.choice(list(board.legal_moves))
+ 
+    def rank_moves(self, board: chess.Board) -> list:
+        """
+        Return all legal moves sorted by model probability, highest first.
+        Useful for analysis.
+ 
+        Returns list of (chess.Move, probability) tuples.
+        """
+        legal_map     = get_legal_move_map(board)
+        legal_indices = list(legal_map.keys())
+ 
+        if not legal_indices:
+            return []
+ 
+        board_tensor = board_to_tensor(board)
+        probs        = self.model.move_probs(board_tensor, legal_indices)
+ 
+        pairs = [(legal_map[idx], p) for idx, p in zip(legal_indices, probs.tolist())]
+        return sorted(pairs, key=lambda x: x[1], reverse=True)
+ 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Sampling helper
+    # ──────────────────────────────────────────────────────────────────────────
+ 
+    def _sample(self, legal_indices: list, legal_map: dict,
+                probs: torch.Tensor) -> chess.Move:
+        """Apply temperature + top-k, then sample one move."""
+ 
+        # Apply temperature scaling
+        scaled = probs ** (1.0 / self.temperature)
+ 
+        # Top-k: keep only the k highest-probability entries
+        k = min(self.top_k, len(legal_indices))
+        topk_vals, topk_local_pos = scaled.topk(k)
+ 
+        # Re-normalise to a valid probability distribution
+        topk_vals = topk_vals / topk_vals.sum()
+ 
+        # Sample one move from the top-k
+        sampled_local = random.choices(
+            population=range(k),
+            weights=topk_vals.tolist(),
+            k=1,
+        )[0]
+ 
+        chosen_global_pos = topk_local_pos[sampled_local].item()
+        chosen_index      = legal_indices[chosen_global_pos]
+        return legal_map[chosen_index]
