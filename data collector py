@@ -1,0 +1,263 @@
+ 
+import os
+import sys
+import json
+import chess
+import chess.pgn
+import requests
+from tqdm import tqdm
+ 
+ 
+# ──────────────────────────────────────────────────────────────────────────────
+# Download from Lichess
+# ──────────────────────────────────────────────────────────────────────────────
+ 
+LICHESS_API = "https://lichess.org/api"
+ 
+ 
+def download_lichess_games(
+    username:   str,
+    output_dir: str = "data/pgn",
+    max_games:  int = 3000,
+    game_types: str = "blitz,rapid,classical",
+    token:      str = None,
+) -> str:
+    """
+    Download a player's games from Lichess in PGN format.
+ 
+    Parameters
+    ----------
+    username   : The Lichess username to download games for.
+    output_dir : Folder where the PGN file will be saved.
+    max_games  : Maximum number of games to download.
+    game_types : Comma-separated Lichess performance types.
+                 Options: bullet, blitz, rapid, classical, correspondence
+    token      : Optional Lichess API token (allows higher download limits).
+                 Get one at https://lichess.org/account/oauth/token
+ 
+    Returns
+    -------
+    Path to the saved PGN file.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"{username}.pgn")
+ 
+    params = {
+        "max":      max_games,
+        "perfType": game_types,
+        "moves":    "true",
+        "clocks":   "false",
+        "evals":    "false",
+        "opening":  "false",
+    }
+ 
+    headers = {"Accept": "application/x-chess-pgn"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+ 
+    print(f"\n⬇  Downloading up to {max_games} games for '{username}' from Lichess...")
+    print(f"   Game types: {game_types}")
+ 
+    try:
+        response = requests.get(
+            f"{LICHESS_API}/games/user/{username}",
+            params=params,
+            headers=headers,
+            stream=True,
+            timeout=60,
+        )
+    except requests.exceptions.ConnectionError:
+        raise ConnectionError(
+            "Could not connect to Lichess. Check your internet connection."
+        )
+ 
+    if response.status_code == 404:
+        raise ValueError(f"Lichess user '{username}' not found.")
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Lichess API returned error {response.status_code}.\n"
+            f"Response: {response.text[:300]}"
+        )
+ 
+    total_bytes = 0
+    with open(output_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
+            total_bytes += len(chunk)
+ 
+    if total_bytes == 0:
+        print(f"⚠  No games found for user '{username}' with game types: {game_types}")
+        print("   Try a different --game_types (e.g. bullet,blitz,rapid)")
+        return output_path
+ 
+    size_kb = total_bytes / 1024
+    print(f"✓  Saved {size_kb:.0f} KB → {output_path}")
+    return output_path
+ 
+ 
+# ──────────────────────────────────────────────────────────────────────────────
+# Parse PGN files
+# ──────────────────────────────────────────────────────────────────────────────
+ 
+def parse_pgn(
+    pgn_paths,
+    max_positions:  int  = 150_000,
+    target_player:  str  = None,
+    min_elo:        int  = None,
+    max_elo:        int  = None,
+    skip_bullet:    bool = False,
+) -> list:
+    """
+    Parse one or more PGN files and extract board positions + the move played.
+ 
+    Parameters
+    ----------
+    pgn_paths      : A file path string, or a list of file path strings.
+    max_positions  : Stop collecting after this many positions.
+    target_player  : If given, ONLY learn from moves made by this player.
+                     Leave None to learn from both sides of every game.
+    min_elo        : Minimum ELO of the relevant player (ignored if None).
+    max_elo        : Maximum ELO of the relevant player (ignored if None).
+    skip_bullet    : If True, skip games with TimeControl < 3 minutes.
+ 
+    Returns
+    -------
+    A list of dicts: [{"fen": str, "move": str (UCI)}, ...]
+    """
+    if isinstance(pgn_paths, str):
+        pgn_paths = [pgn_paths]
+ 
+    positions  = []
+    total_games = 0
+ 
+    for pgn_path in pgn_paths:
+        if not os.path.exists(pgn_path):
+            print(f"⚠  File not found: {pgn_path}  — skipping.")
+            continue
+ 
+        file_size_mb = os.path.getsize(pgn_path) / (1024 * 1024)
+        print(f"\n📄  Parsing {pgn_path}  ({file_size_mb:.1f} MB)")
+ 
+        with open(pgn_path, "r", encoding="utf-8", errors="ignore") as f:
+            game_count  = 0
+            skip_count  = 0
+ 
+            pbar = tqdm(desc="   Games parsed", unit="games")
+ 
+            while len(positions) < max_positions:
+                try:
+                    game = chess.pgn.read_game(f)
+                except Exception:
+                    continue  # Skip malformed games
+ 
+                if game is None:
+                    break  # End of file
+ 
+                game_count  += 1
+                pbar.update(1)
+                headers = game.headers
+ 
+                # ── Skip bullet if requested ──────────────────────────────
+                if skip_bullet:
+                    tc = headers.get("TimeControl", "")
+                    try:
+                        base = int(tc.split("+")[0])
+                        if base < 180:
+                            skip_count += 1
+                            continue
+                    except (ValueError, IndexError):
+                        pass
+ 
+                # ── Target-player colour detection ────────────────────────
+                target_color = None
+                if target_player:
+                    white_name = headers.get("White", "").lower().strip()
+                    black_name = headers.get("Black", "").lower().strip()
+                    tp_lower   = target_player.lower().strip()
+                    if tp_lower == white_name:
+                        target_color = chess.WHITE
+                    elif tp_lower == black_name:
+                        target_color = chess.BLACK
+                    else:
+                        skip_count += 1
+                        continue  # Target player not in this game
+ 
+                # ── ELO filter ────────────────────────────────────────────
+                if (min_elo is not None or max_elo is not None):
+                    elo_key = "WhiteElo" if target_color == chess.WHITE else "BlackElo"
+                    try:
+                        elo = int(headers.get(elo_key, 0))
+                    except ValueError:
+                        elo = 0
+                    if min_elo is not None and elo < min_elo:
+                        skip_count += 1
+                        continue
+                    if max_elo is not None and elo > max_elo:
+                        skip_count += 1
+                        continue
+ 
+                # ── Extract positions ─────────────────────────────────────
+                board = game.board()
+                for move in game.mainline_moves():
+                    if not board.is_legal(move):
+                        try:
+                            board.push(move)
+                        except Exception:
+                            break
+                        continue
+ 
+                    # Record the position only on the right player's turn
+                    if target_color is None or board.turn == target_color:
+                        positions.append({
+                            "fen":  board.fen(),
+                            "move": move.uci(),
+                        })
+ 
+                    try:
+                        board.push(move)
+                    except Exception:
+                        break
+ 
+                if len(positions) >= max_positions:
+                    pbar.close()
+                    print(f"   Reached limit of {max_positions:,} positions.")
+                    break
+ 
+            pbar.close()
+            total_games += game_count
+            if skip_count:
+                print(f"   Skipped {skip_count} games (player filter / ELO / bullet)")
+ 
+    print(f"\n✓  Parsed {total_games:,} games total")
+    print(f"✓  Extracted {len(positions):,} training positions")
+    return positions
+ 
+ 
+# ──────────────────────────────────────────────────────────────────────────────
+# Save / load positions
+# ──────────────────────────────────────────────────────────────────────────────
+ 
+def save_positions(positions: list, path: str = "data/processed/positions.jsonl"):
+    """Write positions to a JSONL file (one JSON object per line)."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for pos in positions:
+            f.write(json.dumps(pos) + "\n")
+    print(f"\n💾  Saved {len(positions):,} positions → {path}")
+ 
+ 
+def load_positions(path: str = "data/processed/positions.jsonl") -> list:
+    """Load positions from a JSONL file."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Positions file not found: {path}\n"
+            "Run  python collect_games.py  first."
+        )
+    positions = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                positions.append(json.loads(line))
+    return positions
+ 
