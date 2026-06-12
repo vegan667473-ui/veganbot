@@ -1,0 +1,188 @@
+
+import os
+import sys
+import json
+import time
+ 
+import chess
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+ 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+ 
+from board_encoder import board_to_tensor, move_to_index
+from model import MaiaNet, save_checkpoint
+ 
+ 
+# ──────────────────────────────────────────────────────────────────────────────
+# Dataset
+# ──────────────────────────────────────────────────────────────────────────────
+ 
+class ChessDataset(Dataset):
+    """
+    Converts each saved {"fen": ..., "move": ...} record into a
+    (board_tensor, move_index) pair on the fly.
+    """
+ 
+    def __init__(self, positions: list):
+        self.positions = positions
+ 
+    def __len__(self):
+        return len(self.positions)
+ 
+    def __getitem__(self, idx):
+        pos  = self.positions[idx]
+        board = chess.Board(pos["fen"])
+        move  = chess.Move.from_uci(pos["move"])
+ 
+        return board_to_tensor(board), torch.tensor(move_to_index(move), dtype=torch.long)
+ 
+ 
+# ──────────────────────────────────────────────────────────────────────────────
+# Main training function
+# ──────────────────────────────────────────────────────────────────────────────
+ 
+def train(
+    positions_path:  str   = "data/processed/positions.jsonl",
+    model_save_path: str   = "models/maia_style.pt",
+    filters:         int   = 32,
+    blocks:          int   = 4,
+    epochs:          int   = 10,
+    batch_size:      int   = 256,
+    lr:              float = 3e-4,
+    val_split:       float = 0.05,
+) -> dict:
+    """
+    Train the model and save the best checkpoint.
+ 
+    Returns a history dict with per-epoch metrics.
+    """
+ 
+    os.makedirs(os.path.dirname(os.path.abspath(model_save_path)), exist_ok=True)
+ 
+    # ── Load data ─────────────────────────────────────────────────────────────
+    print(f"\nLoading positions from  {positions_path} …")
+    with open(positions_path, "r", encoding="utf-8") as f:
+        all_positions = [json.loads(line) for line in f if line.strip()]
+ 
+    n = len(all_positions)
+    print(f"  {n:,} positions total")
+ 
+    if n < 500:
+        print("\n⚠  WARNING: Very few positions.  The bot may play poorly.")
+        print("   Recommended minimum: 5,000 positions (≈ 200 games).\n")
+ 
+    # ── Split ─────────────────────────────────────────────────────────────────
+    split        = int((1 - val_split) * n)
+    train_pos    = all_positions[:split]
+    val_pos      = all_positions[split:]
+ 
+    train_ds = ChessDataset(train_pos)
+    val_ds   = ChessDataset(val_pos)
+ 
+    train_loader = DataLoader(train_ds, batch_size=batch_size,
+                               shuffle=True,  num_workers=0)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size,
+                               shuffle=False, num_workers=0)
+ 
+    print(f"  Train: {len(train_pos):,}   Val: {len(val_pos):,}")
+ 
+    # ── Device ────────────────────────────────────────────────────────────────
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\nDevice: {device}")
+ 
+    # ── Model ─────────────────────────────────────────────────────────────────
+    model = MaiaNet(filters=filters, blocks=blocks).to(device)
+    print(f"Model: {filters} filters, {blocks} blocks  ({model.num_parameters():,} parameters)\n")
+ 
+    # ── Optimiser + scheduler ─────────────────────────────────────────────────
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer,
+                                                      T_max=epochs,
+                                                      eta_min=lr / 10)
+    criterion = nn.CrossEntropyLoss()
+ 
+    best_val_loss = float("inf")
+    history       = []
+ 
+    print("─" * 75)
+    print(f"{'Epoch':>6}  {'Train Loss':>11}  {'Train Acc':>10}  "
+          f"{'Val Loss':>9}  {'Val Acc':>8}  {'Time':>6}")
+    print("─" * 75)
+ 
+    for epoch in range(1, epochs + 1):
+        t0 = time.time()
+ 
+        # ── Train epoch ───────────────────────────────────────────────────────
+        model.train()
+        tr_loss = tr_correct = 0
+ 
+        for boards, moves in tqdm(train_loader,
+                                   desc=f"  Epoch {epoch:02d} [train]",
+                                   leave=False, ncols=70):
+            boards = boards.to(device)
+            moves  = moves.to(device)
+ 
+            optimizer.zero_grad()
+            logits = model(boards)
+            loss   = criterion(logits, moves)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+ 
+            tr_loss    += loss.item() * len(boards)
+            tr_correct += (logits.argmax(1) == moves).sum().item()
+ 
+        scheduler.step()
+ 
+        # ── Validation ────────────────────────────────────────────────────────
+        model.eval()
+        v_loss = v_correct = 0
+ 
+        with torch.no_grad():
+            for boards, moves in val_loader:
+                boards = boards.to(device)
+                moves  = moves.to(device)
+                logits = model(boards)
+                loss   = criterion(logits, moves)
+                v_loss    += loss.item() * len(boards)
+                v_correct += (logits.argmax(1) == moves).sum().item()
+ 
+        avg_tr_loss = tr_loss    / len(train_ds)
+        avg_v_loss  = v_loss     / len(val_ds)
+        tr_acc      = tr_correct / len(train_ds)
+        v_acc       = v_correct  / len(val_ds)
+        elapsed     = time.time() - t0
+ 
+        saved = ""
+        if avg_v_loss < best_val_loss:
+            best_val_loss = avg_v_loss
+            save_checkpoint(model, optimizer, epoch,
+                            avg_v_loss, v_acc, model_save_path)
+            saved = " ← saved"
+ 
+        print(f"  {epoch:>4}   {avg_tr_loss:>11.4f}   {tr_acc:>9.3f}   "
+              f"{avg_v_loss:>9.4f}   {v_acc:>7.3f}   {elapsed:>5.0f}s{saved}")
+ 
+        history.append({
+            "epoch":      epoch,
+            "train_loss": avg_tr_loss,
+            "train_acc":  tr_acc,
+            "val_loss":   avg_v_loss,
+            "val_acc":    v_acc,
+        })
+ 
+    print("─" * 75)
+    print(f"\n✓  Training complete.  Best val_loss = {best_val_loss:.4f}")
+    print(f"✓  Model saved → {model_save_path}")
+ 
+    # Save history alongside the model
+    hist_path = model_save_path.replace(".pt", "_history.json")
+    with open(hist_path, "w") as f:
+        json.dump(history, f, indent=2)
+    print(f"✓  Training history → {hist_path}\n")
+ 
+    return history
