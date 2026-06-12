@@ -1,0 +1,200 @@
+
+import argparse
+import sys
+import os
+ 
+import chess
+ 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
+from engine import MaiaStyleEngine
+ 
+ 
+# ──────────────────────────────────────────────────────────────────────────────
+# Board display
+# ──────────────────────────────────────────────────────────────────────────────
+ 
+# Unicode chess pieces
+PIECES = {
+    chess.Piece(chess.PAWN,   chess.WHITE): "♙",
+    chess.Piece(chess.KNIGHT, chess.WHITE): "♘",
+    chess.Piece(chess.BISHOP, chess.WHITE): "♗",
+    chess.Piece(chess.ROOK,   chess.WHITE): "♖",
+    chess.Piece(chess.QUEEN,  chess.WHITE): "♕",
+    chess.Piece(chess.KING,   chess.WHITE): "♔",
+    chess.Piece(chess.PAWN,   chess.BLACK): "♟",
+    chess.Piece(chess.KNIGHT, chess.BLACK): "♞",
+    chess.Piece(chess.BISHOP, chess.BLACK): "♝",
+    chess.Piece(chess.ROOK,   chess.BLACK): "♜",
+    chess.Piece(chess.QUEEN,  chess.BLACK): "♛",
+    chess.Piece(chess.KING,   chess.BLACK): "♚",
+}
+ 
+def print_board(board: chess.Board, flip: bool = False):
+    """Print a unicode chess board."""
+    print()
+    ranks = range(8) if flip else range(7, -1, -1)
+    for rank in ranks:
+        row = f"  {rank + 1} │"
+        for file in range(8) if not flip else range(7, -1, -1):
+            sq    = chess.square(file, rank)
+            piece = board.piece_at(sq)
+            if piece:
+                row += f" {PIECES.get(piece, '?')} "
+            else:
+                # Light / dark square shading
+                row += " · " if (rank + file) % 2 == 0 else "   "
+        print(row)
+    print("    └─────────────────────────")
+    if not flip:
+        print("      a  b  c  d  e  f  g  h")
+    else:
+        print("      h  g  f  e  d  c  b  a")
+    print()
+ 
+ 
+# ──────────────────────────────────────────────────────────────────────────────
+# Move input
+# ──────────────────────────────────────────────────────────────────────────────
+ 
+def get_player_move(board: chess.Board) -> chess.Move:
+    """Prompt the human for a legal move.  Returns chess.Move."""
+    while True:
+        try:
+            raw = input("Your move: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nQuitting…")
+            sys.exit(0)
+ 
+        if raw.lower() in ("quit", "exit", "q"):
+            print("Thanks for playing!")
+            sys.exit(0)
+ 
+        if raw.lower() in ("moves", "?"):
+            legal = sorted(board.legal_moves, key=lambda m: board.san(m))
+            cols  = [board.san(m).ljust(7) for m in legal]
+            # Print in rows of 8
+            for i in range(0, len(cols), 8):
+                print("  " + "".join(cols[i:i+8]))
+            continue
+ 
+        # Try UCI first
+        try:
+            move = chess.Move.from_uci(raw)
+            if move in board.legal_moves:
+                return move
+        except ValueError:
+            pass
+ 
+        # Try SAN
+        try:
+            move = board.parse_san(raw)
+            if move in board.legal_moves:
+                return move
+        except (ValueError, chess.InvalidMoveError, chess.IllegalMoveError,
+                chess.AmbiguousMoveError):
+            pass
+ 
+        print(f"  ✗  '{raw}' is not a legal move.  "
+              "Type 'moves' to see all options.")
+ 
+ 
+# ──────────────────────────────────────────────────────────────────────────────
+# Main game loop
+# ──────────────────────────────────────────────────────────────────────────────
+ 
+def print_result(board: chess.Board, bot_color: chess.Color):
+    outcome = board.outcome()
+    if outcome is None:
+        print("Game ended without a result.")
+        return
+    if outcome.winner is None:
+        print("  It's a draw!")
+    elif outcome.winner == bot_color:
+        print("  The bot wins!")
+    else:
+        print("  You win! 🎉")
+    print(f"  ({outcome.termination.name.replace('_', ' ').title()})")
+ 
+ 
+def main():
+    parser = argparse.ArgumentParser(
+        description="Play against your Maia-style bot in the terminal.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--model",       type=str,   default="models/maia_style.pt")
+    parser.add_argument("--bot_color",   type=str,   default="black",
+                        choices=["white", "black"],
+                        help="Which colour the bot plays (default: black).")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Bot sampling temperature (default 1.0).")
+    parser.add_argument("--top_k",       type=int,   default=5,
+                        help="Sample from top-k moves (default 5).")
+    args = parser.parse_args()
+ 
+    # ── Setup ──────────────────────────────────────────────────────────────
+    bot_color = chess.WHITE if args.bot_color == "white" else chess.BLACK
+    you_str   = "Black" if bot_color == chess.WHITE else "White"
+ 
+    print("\n" + "─" * 45)
+    print("     Maia-Style Chess Bot  ♟")
+    print("─" * 45)
+    print(f"  You are playing: {you_str}")
+    print(f"  Temperature:     {args.temperature}")
+    print(f"  Top-k:           {args.top_k}")
+    print("  Type 'moves' for legal moves, 'quit' to exit.")
+    print("─" * 45)
+ 
+    # ── Load engine ────────────────────────────────────────────────────────
+    try:
+        engine = MaiaStyleEngine(
+            model_path=args.model,
+            temperature=args.temperature,
+            top_k=args.top_k,
+        )
+    except FileNotFoundError as e:
+        print(f"\nERROR: {e}")
+        print("Run  python train_model.py  first.")
+        sys.exit(1)
+ 
+    board = chess.Board()
+    flip  = (bot_color == chess.WHITE)   # Flip board if bot plays white
+ 
+    move_number = 1
+ 
+    while not board.is_game_over():
+        print_board(board, flip=flip)
+ 
+        if board.turn == chess.WHITE:
+            print(f"Move {move_number} — White's turn")
+        else:
+            print(f"Move {move_number} — Black's turn")
+ 
+        if board.turn == bot_color:
+            # ── Bot's move ────────────────────────────────────────────────
+            print("  Bot is thinking…", end="", flush=True)
+            move = engine.get_move(board)
+            san  = board.san(move)
+            board.push(move)
+            print(f"\r  Bot played: {san:<12}({move.uci()})")
+ 
+            # Show top-3 moves the bot considered
+            # (only compute this for display, not on the critical path)
+        else:
+            # ── Human's move ──────────────────────────────────────────────
+            move = get_player_move(board)
+            san  = board.san(move)
+            board.push(move)
+            print(f"  You played:  {san}")
+ 
+        if board.turn == chess.WHITE:
+            move_number += 1
+ 
+    # ── Game over ──────────────────────────────────────────────────────────
+    print_board(board, flip=flip)
+    print(f"\nGame over!  Result: {board.result()}")
+    print_result(board, bot_color)
+ 
+ 
+if __name__ == "__main__":
+    main()
