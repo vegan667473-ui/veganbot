@@ -1,0 +1,96 @@
+
+import chess
+import numpy as np
+import torch
+ 
+# Piece-type ordering used for plane indices
+PIECE_TYPES = [
+    chess.PAWN, chess.KNIGHT, chess.BISHOP,
+    chess.ROOK, chess.QUEEN, chess.KING,
+]
+ 
+NUM_PLANES  = 18        # Channels in the input tensor
+NUM_SQUARES = 64        # Squares on the board
+NUM_MOVES   = 64 * 64   # 4096 possible from-to slot combinations
+ 
+ 
+# ──────────────────────────────────────────────────────────────────────────────
+# Board → tensor
+# ──────────────────────────────────────────────────────────────────────────────
+ 
+def board_to_tensor(board: chess.Board) -> torch.Tensor:
+    """
+    Convert a chess.Board to a float32 tensor of shape (18, 8, 8).
+ 
+    Axis convention:
+        tensor[plane, rank, file]
+        rank 0 = rank 1 (white's back rank)
+        file 0 = a-file
+    """
+    planes = np.zeros((NUM_PLANES, 8, 8), dtype=np.float32)
+ 
+    # ── Piece planes ──────────────────────────────────────────────────────────
+    for plane_idx, piece_type in enumerate(PIECE_TYPES):
+        for sq in board.pieces(piece_type, chess.WHITE):
+            planes[plane_idx,       chess.square_rank(sq), chess.square_file(sq)] = 1.0
+        for sq in board.pieces(piece_type, chess.BLACK):
+            planes[plane_idx + 6,   chess.square_rank(sq), chess.square_file(sq)] = 1.0
+ 
+    # ── Side to move (plane 12) ───────────────────────────────────────────────
+    if board.turn == chess.WHITE:
+        planes[12] = 1.0
+ 
+    # ── Castling rights (planes 13-16) ────────────────────────────────────────
+    if board.has_kingside_castling_rights(chess.WHITE):
+        planes[13] = 1.0
+    if board.has_queenside_castling_rights(chess.WHITE):
+        planes[14] = 1.0
+    if board.has_kingside_castling_rights(chess.BLACK):
+        planes[15] = 1.0
+    if board.has_queenside_castling_rights(chess.BLACK):
+        planes[16] = 1.0
+ 
+    # ── En-passant square (plane 17) ──────────────────────────────────────────
+    if board.ep_square is not None:
+        planes[17,
+               chess.square_rank(board.ep_square),
+               chess.square_file(board.ep_square)] = 1.0
+ 
+    return torch.from_numpy(planes)
+ 
+ 
+# ──────────────────────────────────────────────────────────────────────────────
+# Move ↔ index conversion
+# ──────────────────────────────────────────────────────────────────────────────
+ 
+def move_to_index(move: chess.Move) -> int:
+    """Flatten (from_square, to_square) into a single integer 0-4095."""
+    return move.from_square * NUM_SQUARES + move.to_square
+ 
+ 
+def index_to_move(index: int, board: chess.Board) -> chess.Move:
+    """
+    Reconstruct a chess.Move from a flat index.
+    Automatically adds queen-promotion when the move is a pawn reaching the
+    last rank.
+    """
+    from_sq = index // NUM_SQUARES
+    to_sq   = index %  NUM_SQUARES
+    move    = chess.Move(from_sq, to_sq)
+ 
+    piece = board.piece_at(from_sq)
+    if piece and piece.piece_type == chess.PAWN:
+        to_rank = chess.square_rank(to_sq)
+        if (board.turn == chess.WHITE and to_rank == 7) or \
+           (board.turn == chess.BLACK and to_rank == 0):
+            move = chess.Move(from_sq, to_sq, promotion=chess.QUEEN)
+ 
+    return move
+ 
+ 
+def get_legal_move_map(board: chess.Board) -> dict:
+    """
+    Return a dict  {move_index (int): chess.Move}  for every legal move
+    in the position.  Used to quickly filter model output to legal moves.
+    """
+    return {move_to_index(m): m for m in board.legal_moves}
