@@ -1,0 +1,105 @@
+ 
+import argparse
+import sys
+import os
+ 
+# Make src/ importable when running from the project root
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
+ 
+from data_collector import download_lichess_games, parse_pgn, save_positions
+ 
+ 
+def main():
+    parser = argparse.ArgumentParser(
+        description="Collect chess games for training the Maia-style bot.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+ 
+    # Sources
+    parser.add_argument("--username",    type=str, default=None,
+                        help="vegan174.")
+    parser.add_argument("--pgn",         type=str, default=None,
+                        help="Path to a local PGN file.")
+    parser.add_argument("--learn_from",  type=str, default=None,
+                        help="Only learn from moves made by this player. "
+                             "Usually the same as --username.")
+ 
+    # Download options
+    parser.add_argument("--max_games",   type=int, default=3000,
+                        help="Max games to download from Lichess (default 3000).")
+    parser.add_argument("--game_types",  type=str, default="blitz,rapid,classical",
+                        help="Lichess time controls to include "
+                             "(default: blitz,rapid,classical).")
+    parser.add_argument("--token",       type=str, default=None,
+                        help="Lichess API token for higher download limits.")
+ 
+    # Filtering
+    parser.add_argument("--max_positions", type=int, default=150_000,
+                        help="Maximum positions to extract (default 150,000).")
+    parser.add_argument("--min_elo",     type=int, default=None,
+                        help="Skip games where the relevant player's ELO is below this.")
+    parser.add_argument("--max_elo",     type=int, default=None,
+                        help="Skip games where the relevant player's ELO is above this.")
+ 
+    # Output
+    parser.add_argument("--output",      type=str,
+                        default="data/processed/positions.jsonl",
+                        help="Output JSONL file (default: data/processed/positions.jsonl).")
+ 
+    args = parser.parse_args()
+ 
+    # ── Validate ──────────────────────────────────────────────────────────────
+    if args.username is None and args.pgn is None:
+        parser.print_help()
+        print("\nERROR: Provide at least one of --username or --pgn")
+        sys.exit(1)
+ 
+    if args.pgn and not os.path.exists(args.pgn):
+        print(f"ERROR: PGN file not found: {args.pgn}")
+        sys.exit(1)
+ 
+    # ── Collect PGN file paths ─────────────────────────────────────────────
+    pgn_files = []
+ 
+    if args.username:
+        pgn_path = download_lichess_games(
+            username=args.username,
+            max_games=args.max_games,
+            game_types=args.game_types,
+            token=args.token,
+        )
+        pgn_files.append(pgn_path)
+ 
+    if args.pgn:
+        pgn_files.append(args.pgn)
+ 
+    # ── Parse positions ───────────────────────────────────────────────────
+    positions = parse_pgn(
+        pgn_paths=pgn_files,
+        max_positions=args.max_positions,
+        target_player=args.learn_from,
+        min_elo=args.min_elo,
+        max_elo=args.max_elo,
+    )
+ 
+    # ── Quality warnings ──────────────────────────────────────────────────
+    n = len(positions)
+    if n == 0:
+        print("\n✗  No positions were extracted.  Check your inputs.")
+        sys.exit(1)
+    elif n < 2_000:
+        print(f"\n⚠  Only {n:,} positions — the bot may play very inconsistently.")
+        print("   Aim for at least 5,000 (roughly 200+ games).")
+    elif n < 10_000:
+        print(f"\n✓  {n:,} positions — decent.  More games = better results.")
+    else:
+        print(f"\n✓  {n:,} positions — great training set!")
+ 
+    # ── Save ──────────────────────────────────────────────────────────────
+    save_positions(positions, args.output)
+    print(f"\nNext step:  python train_model.py")
+ 
+ 
+if __name__ == "__main__":
+    main()
