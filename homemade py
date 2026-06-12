@@ -1,0 +1,88 @@
+ 
+import os
+import sys
+ 
+import chess
+from chess.engine import PlayResult
+ 
+# ── Path setup ────────────────────────────────────────────────────────────────
+# Add the src/ sub-folder so we can import our modules.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "src"))
+ 
+# ── Import the lichess-bot base class ─────────────────────────────────────────
+# The location of MinimalEngine varies between lichess-bot versions.
+_minimal_engine = None
+for _import_path in (
+    "homemade",                          # Newer versions
+    "engines.homemade",                  # Some older versions
+    "lib.engine_wrapper",                # Another possible location
+):
+    try:
+        _mod = __import__(_import_path, fromlist=["MinimalEngine"])
+        _minimal_engine = _mod.MinimalEngine
+        break
+    except (ImportError, AttributeError):
+        continue
+ 
+if _minimal_engine is None:
+    # Fallback stub so this file can be imported outside lichess-bot for testing
+    class _minimal_engine:
+        def __init__(self, *args, **kwargs):
+            pass
+        def search(self, *args, **kwargs):
+            raise NotImplementedError("MinimalEngine not found")
+ 
+MinimalEngine = _minimal_engine   # Alias for clarity
+ 
+ 
+# ──────────────────────────────────────────────────────────────────────────────
+# The bot class
+# ──────────────────────────────────────────────────────────────────────────────
+ 
+class MaiaBot(MinimalEngine):
+    """
+    Lichess-bot homemade engine powered by the Maia-style neural network.
+ 
+    Options you can set in config.yml under engine.options:
+      model_path   : path to the .pt model file (default: maia_style.pt)
+      temperature  : sampling temperature 0.1-2.0 (default: 1.0)
+      top_k        : top-k sampling (default: 5)
+    """
+ 
+    def __init__(self, commands, options, stderr, draw_or_resign,
+                 name=None, **kwargs):
+        super().__init__(commands, options, stderr, draw_or_resign, **kwargs)
+ 
+        model_path  = options.get("model_path",  "maia_style.pt")
+        temperature = float(options.get("temperature", "1.0"))
+        top_k       = int(options.get("top_k", "5"))
+ 
+        # Resolve relative paths from the lichess-bot directory
+        if not os.path.isabs(model_path):
+            model_path = os.path.join(_HERE, model_path)
+ 
+        from engine import MaiaStyleEngine
+        self._engine = MaiaStyleEngine(
+            model_path=model_path,
+            temperature=temperature,
+            top_k=top_k,
+        )
+ 
+        print(f"[MaiaBot] Ready.  model={model_path}  "
+              f"temperature={temperature}  top_k={top_k}")
+ 
+    def search(self, board: chess.Board, time_limit, ponder: bool,
+               draw_offered: bool, root_moves) -> PlayResult:
+        """
+        Called by lichess-bot to get the engine's move.
+        Must return a PlayResult(move, ponder_move).
+        """
+        move = self._engine.get_move(board)
+ 
+        # Safety fallback: if something went wrong, play any legal move
+        if move is None or move not in board.legal_moves:
+            legal = list(board.legal_moves)
+            move  = legal[0] if legal else chess.Move.null()
+ 
+        return PlayResult(move, None)
